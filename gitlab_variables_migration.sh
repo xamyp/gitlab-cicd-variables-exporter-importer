@@ -1,17 +1,37 @@
 #!/bin/bash
 
 TOKEN="glpat-xxxxxxxxxxx"
-SOURCE_PROJECT_ID="xxxx"
-DESTINATION_PROJECT_ID="xxxx"
+SOURCE_ID="xxxx"
+DESTINATION_ID="xxxx"
+SOURCE_TYPE="project" # Can be "project" or "group"
+DESTINATION_TYPE="project" # Can be "project" or "group"
 GITLAB_URL="https://git.test.com"
 API_URL="${GITLAB_URL}/api/v4"
-OUTPUT_FILE="gitlab_cicd_variables_${SOURCE_PROJECT_ID}.json"
-FIXED_OUTPUT_FILE="gitlab_cicd_variables_${SOURCE_PROJECT_ID}_fixed.json"
+OUTPUT_FILE="gitlab_cicd_variables_${SOURCE_TYPE}_${SOURCE_ID}.json"
+FIXED_OUTPUT_FILE="gitlab_cicd_variables_${SOURCE_TYPE}_${SOURCE_ID}_fixed.json"
 TEMP_OUTPUT_FILE=$(mktemp)
 FAILED_VARS_FILE=$(mktemp)
 
 # Creating a file to store failed variables
 echo "[]" > "$FAILED_VARS_FILE"
+
+# Function to get the API endpoint based on entity type (project or group)
+get_api_endpoint() {
+    local entity_type="$1"
+    local entity_id="$2"
+    local endpoint=""
+    
+    if [ "$entity_type" = "project" ]; then
+        endpoint="projects/${entity_id}"
+    elif [ "$entity_type" = "group" ]; then
+        endpoint="groups/${entity_id}"
+    else
+        echo "Error: Invalid entity type. Must be 'project' or 'group'."
+        exit 1
+    fi
+    
+    echo "$endpoint"
+}
 
 # Checking dependencies
 for cmd in curl jq; do
@@ -21,12 +41,15 @@ for cmd in curl jq; do
     fi
 done
 
-echo "Exporting CI/CD variables from project $SOURCE_PROJECT_ID from $GITLAB_URL..."
+SOURCE_ENDPOINT=$(get_api_endpoint "$SOURCE_TYPE" "$SOURCE_ID")
+DESTINATION_ENDPOINT=$(get_api_endpoint "$DESTINATION_TYPE" "$DESTINATION_ID")
+
+echo "Exporting CI/CD variables from ${SOURCE_TYPE} $SOURCE_ID from $GITLAB_URL..."
 
 # Initializing an empty array in the temporary file
 echo "[]" > "$TEMP_OUTPUT_FILE"
 
-# Retrieving CI/CD variables from the source project with pagination
+# Retrieving CI/CD variables from the source project/group with pagination
 page=1
 per_page=100
 total_variables=0
@@ -42,7 +65,7 @@ while true; do
          --silent \
          --write-out "%{http_code}" \
          --output "$page_file" \
-         "${API_URL}/projects/${SOURCE_PROJECT_ID}/variables?page=${page}&per_page=${per_page}")
+         "${API_URL}/${SOURCE_ENDPOINT}/variables?page=${page}&per_page=${per_page}")
     
     # Checking HTTP code
     if [ "$HTTP_CODE" -ne 200 ]; then
@@ -176,11 +199,11 @@ fi
 count=$(jq '. | length' "$FIXED_OUTPUT_FILE")
 echo "CI/CD variables exported to $FIXED_OUTPUT_FILE ($count variables found)"
 
-echo "Importing CI/CD variables into project $DESTINATION_PROJECT_ID..."
+echo "Importing CI/CD variables into ${DESTINATION_TYPE} $DESTINATION_ID..."
 
-# Checking access to the destination project
-if ! curl --header "PRIVATE-TOKEN: $TOKEN" --silent "${API_URL}/projects/${DESTINATION_PROJECT_ID}" | grep -q "id"; then
-    echo "Error: Unable to access the destination project. Check the project ID and your permissions."
+# Checking access to the destination project/group
+if ! curl --header "PRIVATE-TOKEN: $TOKEN" --silent "${API_URL}/${DESTINATION_ENDPOINT}" | grep -q "id"; then
+    echo "Error: Unable to access the destination ${DESTINATION_TYPE}. Check the ID and your permissions."
     exit 1
 fi
 
@@ -189,7 +212,7 @@ counter=0
 success=0
 failed=0
 
-# Reading the JSON file and creating variables in the destination project
+# Reading the JSON file and creating variables in the destination project/group
 jq -c '.[]' "$FIXED_OUTPUT_FILE" | while read -r var_json; do
     counter=$((counter + 1))
     key=$(echo "$var_json" | jq -r '.key')
@@ -203,8 +226,8 @@ jq -c '.[]' "$FIXED_OUTPUT_FILE" | while read -r var_json; do
     echo "$var_json" | jq '{value, variable_type, protected, masked, environment_scope}' > "$tmp_update"
     echo "$var_json" | jq '{key, value, variable_type, protected, masked, environment_scope}' > "$tmp_create"
     
-    # Checking if the variable already exists in the destination project
-    if curl --header "PRIVATE-TOKEN: $TOKEN" --silent "${API_URL}/projects/${DESTINATION_PROJECT_ID}/variables/${key}" | grep -q "key"; then
+    # Checking if the variable already exists in the destination project/group
+    if curl --header "PRIVATE-TOKEN: $TOKEN" --silent "${API_URL}/${DESTINATION_ENDPOINT}/variables/${key}" | grep -q "key"; then
         # Updating the existing variable
         echo "Updating variable $key..."
         response=$(curl --request PUT \
@@ -213,7 +236,7 @@ jq -c '.[]' "$FIXED_OUTPUT_FILE" | while read -r var_json; do
              --data @"$tmp_update" \
              --write-out "\n%{http_code}" \
              --silent \
-             "${API_URL}/projects/${DESTINATION_PROJECT_ID}/variables/${key}")
+             "${API_URL}/${DESTINATION_ENDPOINT}/variables/${key}")
         
         http_code=$(echo "$response" | tail -n1)
         if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
@@ -239,7 +262,7 @@ jq -c '.[]' "$FIXED_OUTPUT_FILE" | while read -r var_json; do
              --data @"$tmp_create" \
              --write-out "\n%{http_code}" \
              --silent \
-             "${API_URL}/projects/${DESTINATION_PROJECT_ID}/variables")
+             "${API_URL}/${DESTINATION_ENDPOINT}/variables")
         
         http_code=$(echo "$response" | tail -n1)
         if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
@@ -282,7 +305,7 @@ if [ "$failed" -gt 0 ]; then
     jq -r '.[] | "Variable: \(.key)\nOperation: \(.operation)\nHTTP Code: \(.http_code)\nError: \(.error)\n-------------------"' "$FAILED_VARS_FILE"
     
     # Save this list to a file
-    failed_report="gitlab_cicd_failed_vars_${SOURCE_PROJECT_ID}_to_${DESTINATION_PROJECT_ID}.txt"
+    failed_report="gitlab_cicd_failed_vars_${SOURCE_TYPE}_${SOURCE_ID}_to_${DESTINATION_TYPE}_${DESTINATION_ID}.txt"
     jq -r '.[] | "Variable: \(.key)\nOperation: \(.operation)\nHTTP Code: \(.http_code)\nError: \(.error)\n-------------------"' "$FAILED_VARS_FILE" > "$failed_report"
     
     echo ""
